@@ -3,36 +3,36 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-
+using namespace std;
 namespace tracks {
 
 struct Stop {
-    std::string id;
-    std::string name;
+    string id;
+    string name;
     double lat;
     double lon;
 };
 
 struct Edge {
     int to;
-    std::string route_id;
+    string route_id;
     std::string route_code;
-    std::string route_name;
+    string route_name;
     std::string color_hex;
-    std::string mode;
-    std::string operator_name;
-    std::string fare_model;
+    string mode;
+    string operator_name;
+    string fare_model;
     double distance_km;
     int base_minutes;
     int fare_rupiah;
     int headway_minutes;
-    std::vector<int> departure_minutes;
+    vector<int> departure_minutes;
 };
 
 struct Graph {
-    std::vector<Stop> stops;
-    std::unordered_map<std::string, int> stop_index;
-    std::vector<std::vector<Edge>> adjacency;
+    vector<Stop> stops;
+    unordered_map<string, int> stop_index;
+    vector<vector<Edge>> adjacency;
 };
 
 } // namespace tracks
