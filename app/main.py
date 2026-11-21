@@ -5,6 +5,10 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from kivy.config import Config
+
+Config.set("input", "mouse", "mouse,disable_multitouch")
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(Path(__file__).parent))
@@ -23,10 +27,11 @@ from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
+from kivy.uix.stencilview import StencilView
 from kivy.uix.textinput import TextInput
 from kivy.graphics import Color, Line, Rectangle, RoundedRectangle
 from kivy.uix.widget import Widget
-from kivy.core.window import Window
+from kivy.core.window import Keyboard, Window
 from kivy.event import EventDispatcher
 
 try:
@@ -125,92 +130,322 @@ class TrackActionButton(Button):
         self.shape.radius = [self.radius]
 
 
+def _hex_color(value, fallback):
+    if isinstance(value, str) and len(value) == 7 and value.startswith("#"):
+        try:
+            return tuple(
+                int(value[index:index + 2], 16) / 255.0
+                for index in (1, 3, 5)
+            ) + (1,)
+        except ValueError:
+            pass
+    return tuple(fallback) + ((1,) if len(fallback) == 3 else ())
+
+
+def _format_rupiah(amount):
+    return "Rp {:,.0f}".format(amount).replace(",", ".")
+
+
+class RouteStepRow(BoxLayout):
+    MODE_LABELS = {
+        "angkot": ("A", "ANGKOT"),
+        "damri": ("B", "BUS"),
+        "kereta": ("K", "KERETA"),
+        "jalan_kaki": ("W", "JALAN"),
+    }
+
+    def __init__(self, step, fallback_color, **kwargs):
+        super().__init__(
+            orientation="horizontal",
+            size_hint_y=None,
+            height=dp(44),
+            spacing=dp(6),
+            **kwargs,
+        )
+        mode = step.get("mode", "angkot")
+        color = _hex_color(step.get("color_hex"), fallback_color)
+        icon_text, mode_text = self.MODE_LABELS.get(
+            mode, (mode[:1].upper(), mode.upper())
+        )
+
+        marker_column = BoxLayout(
+            orientation="vertical",
+            size_hint_x=None,
+            width=dp(62),
+            spacing=dp(2),
+        )
+        marker = Surface(
+            orientation="vertical",
+            size_hint=(None, None),
+            size=(dp(24), dp(24)),
+            radius=dp(12),
+            border_width=dp(0.5),
+            background_color=color,
+            border_color=color,
+        )
+        marker.add_widget(Label(
+            text=icon_text,
+            color=PALETTE["surface"],
+            bold=True,
+            font_size=dp(11),
+        ))
+        marker_column.add_widget(marker)
+        marker_column.add_widget(Label(
+            text=mode_text,
+            color=color,
+            bold=True,
+            font_size=dp(8),
+            size_hint_y=None,
+            height=dp(11),
+        ))
+        self.add_widget(marker_column)
+
+        route_code = step.get("route_code") or step.get("route_id", "")
+        route_name = step.get("route_name", "")
+        route_title = route_name
+        if route_code and route_code != route_name:
+            route_title = "{} · {}".format(route_code, route_name)
+        from_stop = step.get("from_stop") or step.get("from", "Titik awal")
+        to_stop = step.get("to_stop") or step.get("to", "Titik tujuan")
+        self.detail_label = Label(
+            text="{}\nNaik di {} -> Turun di {} · {} mnt".format(
+                route_title,
+                from_stop,
+                to_stop,
+                step.get("duration_minutes", 0),
+            ),
+            color=PALETTE["ink"],
+            font_size=dp(10),
+            halign="left",
+            valign="top",
+            size_hint=(1, None),
+            height=dp(34),
+            text_size=(dp(160), None),
+        )
+        self.detail_label.bind(
+            width=self._sync_detail_text,
+            texture_size=self._update_height,
+        )
+        self.add_widget(self.detail_label)
+
+        fare = step.get("fare_rupiah", 0)
+        self.fare_label = Label(
+            text=_format_rupiah(fare) if fare else "Gratis",
+            color=PALETTE["ink"],
+            bold=True,
+            font_size=dp(10),
+            halign="right",
+            valign="top",
+            shorten=True,
+            max_lines=1,
+            size_hint_x=None,
+            size_hint_y=None,
+            width=dp(76),
+            height=dp(18),
+        )
+        self.fare_label.bind(
+            size=lambda widget, size: setattr(widget, "text_size", size)
+        )
+        self.add_widget(self.fare_label)
+        self.bind(size=self._layout_row, parent=self._layout_row)
+        self._layout_row()
+
+    def _update_height(self, _widget, texture_size):
+        self.detail_label.height = max(dp(34), texture_size[1])
+        self.height = max(dp(44), self.detail_label.height)
+
+    def _sync_detail_text(self, widget, width):
+        widget.text_size = (max(1, width), None)
+        widget.texture_update()
+
+    def _layout_row(self, *_):
+        if self.parent is not None and self.width > 0:
+            self.do_layout()
+
+
 class RouteOptionCard(ButtonBehavior, Surface):
     selection = NumericProperty(0)
+    expand_progress = NumericProperty(0)
+    COLLAPSED_HEIGHT = dp(104)
 
     def __init__(self, route, color, on_select, **kwargs):
         super().__init__(
             orientation="vertical",
             size_hint_y=None,
-            height=dp(132),
-            padding=dp(12),
-            spacing=dp(6),
+            height=self.COLLAPSED_HEIGHT,
+            padding=dp(10),
+            spacing=dp(5),
             border_width=dp(1),
             **kwargs,
         )
         self.route = route
         self.route_color = tuple(color) + ((1,) if len(color) == 3 else ())
         self.on_select = on_select
-        self.bind(on_release=lambda *_: on_select())
-        self.bind(selection=self._apply_selection)
+        self._detail_height = 0
+        self.bind(
+            on_release=lambda *_: on_select(),
+            selection=self._apply_selection,
+            expand_progress=self._apply_expansion,
+        )
 
-        header = BoxLayout(size_hint_y=None, height=dp(30), spacing=dp(6))
+        header = BoxLayout(size_hint_y=None, height=dp(24), spacing=dp(6))
         title = Label(
-            text=route["display_name"],
+            text=route.get("display_name", "Pilihan rute"),
             color=PALETTE["ink"],
             bold=True,
+            font_size=dp(12),
             halign="left",
             valign="middle",
         )
         title.bind(size=lambda widget, size: setattr(widget, "text_size", size))
         header.add_widget(title)
+        total_fare = Label(
+            text=_format_rupiah(route.get("fare_rupiah", 0)),
+            color=PALETTE["ink"],
+            bold=True,
+            font_size=dp(13),
+            halign="right",
+            valign="middle",
+            size_hint_x=None,
+            width=dp(88),
+        )
+        total_fare.bind(
+            size=lambda widget, size: setattr(widget, "text_size", size)
+        )
+        header.add_widget(total_fare)
         self.add_widget(header)
 
-        badge_box = BoxLayout(size_hint_y=None, height=dp(26), spacing=dp(5))
+        self.badge_scroll = ScrollView(
+            size_hint=(1, None),
+            height=dp(25),
+            do_scroll_x=True,
+            do_scroll_y=False,
+            bar_width=0,
+        )
+        badge_row = BoxLayout(
+            orientation="horizontal",
+            size_hint=(None, 1),
+            spacing=dp(4),
+        )
+        badge_row.bind(minimum_width=badge_row.setter("width"))
         badges = route.get("route_badges") or [{
             "mode_label": "ANGKOT",
             "route_id": "Trayek",
             "route_name": route.get("route_name", "Angkot"),
         }]
-        for badge_info in badges[:2]:
-            badge_label = Label(
-                text="{}  {}  {}".format(
-                    badge_info["mode_label"],
-                    badge_info["route_id"],
-                    badge_info["route_name"],
+        for index, badge in enumerate(badges):
+            if index:
+                badge_row.add_widget(Label(
+                    text=">",
+                    color=PALETTE["muted"],
+                    size_hint_x=None,
+                    width=dp(10),
+                    font_size=dp(10),
+                ))
+            mode_label = {
+                "JALAN": "Jalan Kaki",
+                "BUS": "Damri",
+                "ANGKOT": "Angkot",
+                "KERETA": "Kereta",
+            }.get(badge.get("mode_label", ""), badge.get("mode_label", "Rute"))
+            route_code = badge.get("route_code") or badge.get("route_id", "")
+            text = mode_label if mode_label == "Jalan Kaki" else (
+                "{} {}".format(mode_label, route_code) if route_code else mode_label
+            )
+            badge_color = _hex_color(
+                badge.get("color_hex"), self.route_color
+            )
+            pill = Surface(
+                orientation="horizontal",
+                size_hint=(None, None),
+                height=dp(23),
+                padding=[dp(7), dp(1)],
+                radius=dp(11),
+                border_width=dp(0.7),
+                background_color=(
+                    badge_color[0], badge_color[1], badge_color[2], 0.10
                 ),
-                color=self.route_color,
+                border_color=(
+                    badge_color[0], badge_color[1], badge_color[2], 0.5
+                ),
+            )
+            pill.bind(minimum_width=pill.setter("width"))
+            badge_label = Label(
+                text=text,
+                color=badge_color,
                 bold=True,
-                font_size=dp(11),
-                halign="left",
-                valign="middle",
+                font_size=dp(9),
+                size_hint=(None, 1),
             )
             badge_label.bind(
-                size=lambda widget, size: setattr(widget, "text_size", size)
+                texture_size=lambda widget, size: setattr(widget, "width", size[0])
             )
-            badge_box.add_widget(badge_label)
-        self.add_widget(badge_box)
+            pill.add_widget(badge_label)
+            badge_row.add_widget(pill)
+        self.badge_scroll.add_widget(badge_row)
+        self.add_widget(self.badge_scroll)
 
-        detail = Label(
-            text=f"{route['duration_minutes']} mnt  ·  {route['departure']}–{route['arrival']}",
+        summary = BoxLayout(size_hint_y=None, height=dp(19), spacing=dp(6))
+        summary.add_widget(Label(
+            text="{} mnt".format(route.get("duration_minutes", 0)),
             color=PALETTE["muted"],
+            font_size=dp(10),
             halign="left",
             valign="middle",
-            size_hint_y=None,
-            height=dp(22),
-        )
-        detail.bind(size=lambda widget, size: setattr(widget, "text_size", size))
-        self.add_widget(detail)
-        fare = Label(
-            text=f"Rp {route['fare_rupiah']:,.0f}",
-            color=PALETTE["ink"],
-            bold=True,
-            halign="left",
+        ))
+        times = Label(
+            text="{} - {}".format(
+                route.get("departure", "--:--"),
+                route.get("arrival", "--:--"),
+            ),
+            color=PALETTE["muted"],
+            font_size=dp(10),
+            halign="right",
             valign="middle",
-            size_hint_y=None,
-            height=dp(22),
+            size_hint_x=None,
+            width=dp(112),
         )
-        fare.bind(size=lambda widget, size: setattr(widget, "text_size", size))
-        self.add_widget(fare)
+        times.bind(size=lambda widget, size: setattr(widget, "text_size", size))
+        summary.add_widget(times)
+        self.add_widget(summary)
+
+        self.details = BoxLayout(
+            orientation="vertical",
+            size_hint_y=None,
+            height=0,
+            spacing=dp(6),
+            opacity=0,
+        )
+        self.details.bind(minimum_height=self._set_detail_height)
+        for step in route.get("steps", []):
+            self.details.add_widget(RouteStepRow(step, self.route_color))
+        self.add_widget(self.details)
         self._apply_selection()
+        self._apply_expansion()
 
     def set_selected(self, selected):
         Animation.cancel_all(self, "selection")
+        Animation.cancel_all(self, "expand_progress")
         Animation(
             selection=1 if selected else 0,
-            duration=0.18,
+            duration=0.22,
             t="out_cubic",
         ).start(self)
+        Animation(
+            expand_progress=1 if selected else 0,
+            duration=0.28,
+            t="out_cubic",
+        ).start(self)
+
+    def _set_detail_height(self, _details, height):
+        self._detail_height = height
+        self._apply_expansion()
+
+    def _apply_expansion(self, *_):
+        progress = self.expand_progress
+        self.details.height = self._detail_height * progress
+        self.details.opacity = progress
+        self.height = self.COLLAPSED_HEIGHT + self._detail_height * progress
 
     def _apply_selection(self, *_):
         amount = self.selection
@@ -365,7 +600,7 @@ class FallbackMap(Widget):
                 Line(circle=(x, y, dp(5)), width=dp(2))
 
 
-class RouteMap(FloatLayout):
+class RouteMap(StencilView):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.markers = []
@@ -373,19 +608,95 @@ class RouteMap(FloatLayout):
         self.pin_overlay = None
         self.pin_center_callback = None
         self.fallback_center = (-6.9175, 107.6191)
+        self._pressed_ctrl_keys = set()
+        self._ctrl_zoom_touch = None
+        self._ctrl_zoom_last_y = None
         if HAS_MAPVIEW:
             self.map = MapView(
                 lat=-6.9175, lon=107.6191, zoom=12,
                 double_tap_zoom=True,
-                size_hint=(1, 1),
-                pos_hint={"x": 0, "y": 0},
+                size_hint=(None, None),
+                pos=self.pos,
+                size=self.size,
             )
+            self.map._scatter.do_scale = False
+            Window.bind(on_key_down=self._on_key_down, on_key_up=self._on_key_up)
+            Window.bind(on_focus=self._on_window_focus)
             self.add_widget(self.map)
         else:
             self.map = FallbackMap(
-                size_hint=(1, 1), pos_hint={"x": 0, "y": 0}
+                size_hint=(None, None), pos=self.pos, size=self.size
             )
             self.add_widget(self.map)
+        self.bind(pos=self._sync_map_geometry, size=self._sync_map_geometry)
+        self._sync_map_geometry()
+
+    def _sync_map_geometry(self, *_):
+        self.map.pos = self.pos
+        self.map.size = self.size
+
+    def _set_ctrl_scale(self, enabled):
+        if HAS_MAPVIEW:
+            self.map._scatter.do_scale = enabled
+
+    def _on_key_down(self, _window, key, *_):
+        if key in (Keyboard.keycodes["lctrl"], Keyboard.keycodes["rctrl"]):
+            self._pressed_ctrl_keys.add(key)
+            self._set_ctrl_scale(True)
+
+    def _on_key_up(self, _window, key, *_):
+        if key in self._pressed_ctrl_keys:
+            self._pressed_ctrl_keys.discard(key)
+            self._set_ctrl_scale(bool(self._pressed_ctrl_keys))
+
+    def _on_window_focus(self, _window, focused):
+        if not focused and self._pressed_ctrl_keys:
+            self._pressed_ctrl_keys.clear()
+            self._set_ctrl_scale(False)
+
+    def unbind_keyboard(self):
+        if HAS_MAPVIEW:
+            Window.unbind(
+                on_key_down=self._on_key_down,
+                on_key_up=self._on_key_up,
+                on_focus=self._on_window_focus,
+            )
+            self._pressed_ctrl_keys.clear()
+            self._set_ctrl_scale(False)
+
+    def on_touch_down(self, touch):
+        if (
+            HAS_MAPVIEW
+            and self._pressed_ctrl_keys
+            and "button" in touch.profile
+            and touch.button == "left"
+            and self.collide_point(*touch.pos)
+        ):
+            self._ctrl_zoom_touch = touch.uid
+            self._ctrl_zoom_last_y = touch.y
+            touch.grab(self)
+            return True
+        return super().on_touch_down(touch)
+
+    def on_touch_move(self, touch):
+        if touch.grab_current is self and touch.uid == self._ctrl_zoom_touch:
+            if self._pressed_ctrl_keys:
+                delta_y = touch.y - self._ctrl_zoom_last_y
+                self._ctrl_zoom_last_y = touch.y
+                if delta_y:
+                    self.map.animated_diff_scale_at(
+                        delta_y / dp(120), *touch.pos
+                    )
+            return True
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        if touch.grab_current is self and touch.uid == self._ctrl_zoom_touch:
+            touch.ungrab(self)
+            self._ctrl_zoom_touch = None
+            self._ctrl_zoom_last_y = None
+            return True
+        return super().on_touch_up(touch)
 
     def clear_markers(self):
         if not HAS_MAPVIEW:
@@ -530,7 +841,7 @@ class RouteMap(FloatLayout):
             return
         source = self.map.map_source
         min_zoom = source.get_min_zoom()
-        max_zoom = source.get_max_zoom()
+        max_zoom = min(source.get_max_zoom(), 17)
         zoom = min_zoom
         for candidate in range(max_zoom, min_zoom - 1, -1):
             route_width = abs(
@@ -603,8 +914,8 @@ class TrackSumApp(MDApp if HAS_MD else App):
         sidebar = Surface(
             orientation="vertical",
             size_hint=(0.37, 1),
-            padding=dp(14),
-            spacing=dp(9),
+            padding=[dp(14), dp(8), dp(14), dp(10)],
+            spacing=dp(7),
             radius=dp(20),
             background_color=PALETTE["surface"],
             border_color=(0.88, 0.90, 0.93, 1),
@@ -697,6 +1008,14 @@ class TrackSumApp(MDApp if HAS_MD else App):
             size_hint_y=None,
             height=dp(22),
         )
+        self.route_status.bind(
+            width=lambda widget, width: setattr(
+                widget, "text_size", (width, None)
+            ),
+            texture_size=lambda widget, size: setattr(
+                widget, "height", max(dp(22), size[1])
+            ),
+        )
         sidebar.add_widget(self.route_status)
         sidebar.add_widget(Label(
             text="PILIHAN RUTE",
@@ -736,6 +1055,8 @@ class TrackSumApp(MDApp if HAS_MD else App):
     def on_stop(self):
         if hasattr(self, "executor"):
             self.executor.shutdown(wait=False, cancel_futures=True)
+        if hasattr(self, "map_panel"):
+            self.map_panel.unbind_keyboard()
 
     def _stop_by_id(self, stop_id):
         return next((stop for stop in self.stops if stop["id"] == stop_id), None)
@@ -1144,6 +1465,60 @@ class TrackSumApp(MDApp if HAS_MD else App):
         ), None)
         return edge, edge is not None
 
+    def _route_edge_path(self, route_id, start_id, goal_id):
+        if start_id == goal_id:
+            stop = next(
+                (stop for stop in self.stops if stop["id"] == start_id),
+                None,
+            )
+            return [] if stop is None else [{
+                "lat": stop["lat"], "lon": stop["lon"]
+            }]
+
+        adjacency = {}
+        for edge in self.route_data["routes"]:
+            if edge.get("route_id") != route_id:
+                continue
+            adjacency.setdefault(edge["from"], []).append(
+                (edge["to"], edge, False)
+            )
+            if self.route_data.get("bidirectional") or edge.get(
+                "reverse_departure_minutes"
+            ):
+                adjacency.setdefault(edge["to"], []).append(
+                    (edge["from"], edge, True)
+                )
+
+        queue = [start_id]
+        parent = {start_id: None}
+        cursor = 0
+        while cursor < len(queue) and goal_id not in parent:
+            current = queue[cursor]
+            cursor += 1
+            for next_stop, edge, reverse in adjacency.get(current, []):
+                if next_stop in parent:
+                    continue
+                parent[next_stop] = (current, edge, reverse)
+                queue.append(next_stop)
+
+        if goal_id not in parent:
+            return []
+        edge_path = []
+        current = goal_id
+        while current != start_id:
+            previous, edge, reverse = parent[current]
+            edge_path.append((edge, reverse))
+            current = previous
+        edge_path.reverse()
+
+        coordinates = []
+        for edge, reverse in edge_path:
+            points = self._edge_coordinates(edge, reverse)
+            if coordinates and points and coordinates[-1] == points[0]:
+                points = points[1:]
+            coordinates.extend(points)
+        return coordinates
+
     def _reference_geometry(self, reference, visited):
         detailed = self.route_data.get("detailed_geometries", {})
         if reference in detailed:
@@ -1198,22 +1573,18 @@ class TrackSumApp(MDApp if HAS_MD else App):
         points.append({"lat": goal["lat"], "lon": goal["lon"]})
         return points
 
-    def _route_color(self, route_id, mode):
+    def _route_color(self, route_id, mode, color_hex=None):
         metadata = next((
             entry for entry in self.route_data.get("route_catalog", [])
             if entry.get("route_id") == route_id
         ), {})
-        value = metadata.get("route_color")
-        if value and len(value) == 7 and value.startswith("#"):
-            return tuple(
-                int(value[index:index + 2], 16) / 255.0
-                for index in (1, 3, 5)
-            )
-        return {
+        value = color_hex or metadata.get("route_color")
+        fallback = {
             "damri": (0.02, 0.39, 0.69),
             "kereta": (0.84, 0.11, 0.14),
             "jalan_kaki": (0.40, 0.44, 0.49),
         }.get(mode, PALETTE["green"][:3])
+        return _hex_color(value, fallback)[:3]
 
     def route_segments(self, route):
         stops_by_name = {stop["name"]: stop for stop in self.stops}
@@ -1225,12 +1596,11 @@ class TrackSumApp(MDApp if HAS_MD else App):
                 goal = stops_by_name.get(step.get("to"))
                 if start is None or goal is None:
                     continue
-                edge, reverse = self._find_edge(
+                coordinates = self._route_edge_path(
                     step.get("route_id", ""),
                     start["id"],
                     goal["id"],
                 )
-                coordinates = self._edge_coordinates(edge, reverse)
                 if not coordinates:
                     coordinates = [
                         {"lat": start["lat"], "lon": start["lon"]},
@@ -1239,7 +1609,9 @@ class TrackSumApp(MDApp if HAS_MD else App):
             segments.append({
                 "mode": step.get("mode", "angkot"),
                 "color": self._route_color(
-                    step.get("route_id", ""), step.get("mode", "angkot")
+                    step.get("route_id", ""),
+                    step.get("mode", "angkot"),
+                    step.get("color_hex"),
                 ),
                 "coordinates": coordinates,
             })
@@ -1272,17 +1644,29 @@ class TrackSumApp(MDApp if HAS_MD else App):
             if route_id and key not in seen:
                 seen.add(key)
                 metadata = known.get(route_id, {})
+                mode_label = {
+                    "angkot": "ANGKOT",
+                    "damri": "BUS",
+                    "kereta": "KERETA",
+                    "jalan_kaki": "JALAN",
+                }.get(mode, mode.upper())
+                color_hex = (
+                    step.get("color_hex") or metadata.get("route_color")
+                )
+                if not color_hex and mode == "jalan_kaki":
+                    color_hex = "#707070"
                 badges.append({
-                    "mode_label": {
-                        "angkot": "ANGKOT",
-                        "damri": "BUS",
-                        "kereta": "KERETA",
-                        "jalan_kaki": "JALAN",
-                    }.get(mode, mode.upper()),
+                    "mode_label": mode_label,
                     "route_id": route_id,
+                    "route_code": (
+                        step.get("route_code")
+                        or metadata.get("route_code")
+                        or route_id
+                    ),
                     "route_name": metadata.get(
                         "route_name", step.get("route_name", "Trayek")
                     ),
+                    "color_hex": color_hex,
                 })
         return badges or [{
             "mode_label": "ANGKOT",
@@ -1420,11 +1804,15 @@ class TrackSumApp(MDApp if HAS_MD else App):
             if origin_walk:
                 steps.insert(0, {
                     "route_id": "WALK-ORIGIN",
+                    "route_code": "WALK",
                     "route_name": "Jalan kaki ke transit",
                     "mode": "jalan_kaki",
+                    "color_hex": "#707070",
                     "operator": "Jalan kaki",
                     "from": origin.name,
                     "to": origin_stop["name"],
+                    "from_stop": origin.name,
+                    "to_stop": origin_stop["name"],
                     "fare_rupiah": 0,
                     "wait_minutes": 0,
                     "duration_minutes": origin_walk,
@@ -1438,11 +1826,15 @@ class TrackSumApp(MDApp if HAS_MD else App):
             if destination_walk:
                 steps.append({
                     "route_id": "WALK-DESTINATION",
+                    "route_code": "WALK",
                     "route_name": "Jalan kaki ke tujuan",
                     "mode": "jalan_kaki",
+                    "color_hex": "#707070",
                     "operator": "Jalan kaki",
                     "from": destination_stop["name"],
                     "to": destination.name,
+                    "from_stop": destination_stop["name"],
+                    "to_stop": destination.name,
                     "fare_rupiah": 0,
                     "wait_minutes": 0,
                     "duration_minutes": destination_walk,

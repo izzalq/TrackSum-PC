@@ -4,6 +4,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 using namespace std;
 namespace tracks {
@@ -83,6 +84,26 @@ static bool load_graph(const char* path, Graph& graph) {
 
     size_t stops_section = json.find("\"stops\"");
     size_t routes_section = json.find("\"routes\"", stops_section);
+    unordered_map<string, pair<string, string>> route_catalog;
+    size_t catalog_section = json.find("\"route_catalog\"");
+    if (catalog_section != string::npos) {
+        size_t catalog_end = json.find(']', catalog_section);
+        size_t catalog_item = json.find('{', catalog_section);
+        while (catalog_item != string::npos && catalog_item < catalog_end) {
+            size_t item_end = json.find('}', catalog_item);
+            string route_id = get_string(json, catalog_item, item_end, "route_id");
+            if (!route_id.empty()) {
+                string route_code = get_string(json, catalog_item, item_end, "route_code");
+                string color_hex = get_string(json, catalog_item, item_end, "color_hex");
+                if (color_hex.empty()) {
+                    color_hex = get_string(json, catalog_item, item_end, "route_color");
+                }
+                route_catalog[route_id] = {route_code, color_hex};
+            }
+            catalog_item = json.find('{', item_end + 1);
+        }
+    }
+
     size_t p = stops_section;
     while ((p = json.find('{', p)) != string::npos && p < routes_section) {
         size_t end = json.find('}', p);
@@ -106,7 +127,12 @@ static bool load_graph(const char* path, Graph& graph) {
         size_t end = json.find('}', p);
         string route_id = get_string(json, p, end, "route_id");
         if (!route_id.empty()) {
+            string route_code = get_string(json, p, end, "route_code");
             string route_name = get_string(json, p, end, "route_name");
+            string color_hex = get_string(json, p, end, "color_hex");
+            if (color_hex.empty()) {
+                color_hex = get_string(json, p, end, "route_color");
+            }
             string mode = get_string(json, p, end, "mode");
             string operator_name = get_string(json, p, end, "operator");
             string fare_model = get_string(json, p, end, "fare_model");
@@ -126,17 +152,30 @@ static bool load_graph(const char* path, Graph& graph) {
             if (fare_model.empty()) {
                 fare_model = mode == "angkot" ? "distance_tiered" : "flat";
             }
+            auto catalog_entry = route_catalog.find(route_id);
+            if (catalog_entry != route_catalog.end()) {
+                if (route_code.empty()) route_code = catalog_entry->second.first;
+                if (color_hex.empty()) color_hex = catalog_entry->second.second;
+            }
+            if (route_code.empty()) route_code = route_id;
+            if (color_hex.empty()) {
+                color_hex = mode == "kereta" ? "#D71920"
+                    : mode == "jalan_kaki" ? "#707070"
+                    : mode == "damri" ? "#F7941D" : "#4CAF50";
+            }
             if (graph.stop_index.count(from) && graph.stop_index.count(to)) {
                 int u = graph.stop_index[from];
                 int v = graph.stop_index[to];
                 graph.adjacency[u].push_back({
-                    v, route_id, route_name, mode, operator_name, fare_model, 0.0,
-                    minutes, fare, headway, forward_departures
+                    v, route_id, route_code, route_name, color_hex, mode,
+                    operator_name, fare_model, 0.0, minutes, fare, headway,
+                    forward_departures
                 });
                 if (!reverse_departures.empty()) {
                     graph.adjacency[v].push_back({
-                        u, route_id, route_name, mode, operator_name, fare_model, 0.0,
-                        minutes, fare, headway, reverse_departures
+                        u, route_id, route_code, route_name, color_hex, mode,
+                        operator_name, fare_model, 0.0, minutes, fare, headway,
+                        reverse_departures
                     });
                 }
             }
@@ -152,8 +191,8 @@ static bool load_graph(const char* path, Graph& graph) {
             for (const Edge& edge : copy[u]) {
                 if (!edge.departure_minutes.empty()) continue;
                 graph.adjacency[edge.to].push_back(
-                    {u, edge.route_id, edge.route_name, edge.mode, edge.operator_name,
-                     edge.fare_model,
+                    {u, edge.route_id, edge.route_code, edge.route_name,
+                     edge.color_hex, edge.mode, edge.operator_name, edge.fare_model,
                      edge.distance_km, edge.base_minutes, edge.fare_rupiah,
                      edge.headway_minutes, edge.departure_minutes});
             }

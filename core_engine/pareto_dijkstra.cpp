@@ -293,34 +293,56 @@ string find_routes_json(const Graph& graph, const string& start_id,
         out << "],\"steps\":[";
         double elapsed = 0.0;
         string last_route_id;
-        for (size_t e = 0; e < route.edges.size(); ++e) {
-            const Edge* edge = route.edges[e];
-            double wait = edge_wait_minutes(
-                *edge, last_route_id, departure_hhmm, elapsed);
-            double duration_minutes = edge_travel_minutes(
-                *edge, graph, route.nodes[e], departure_hhmm, last_route_id,
-                elapsed);
-            int step_duration = static_cast<int>(ceil(duration_minutes));
-            double charged_fare = edge_fare(*edge, last_route_id);
-            if (e > 0) out << ",";
-            out << "{\"route_id\":\"" << json_escape(edge->route_id) << "\","
-                << "\"route_name\":\"" << json_escape(edge->route_name) << "\","
-                << "\"mode\":\"" << json_escape(edge->mode) << "\","
-                << "\"operator\":\"" << json_escape(edge->operator_name) << "\","
-                << "\"fare_model\":\"" << json_escape(edge->fare_model) << "\","
-                << "\"from\":\"" << json_escape(graph.stops[route.nodes[e]].name) << "\","
-                << "\"to\":\"" << json_escape(graph.stops[route.nodes[e + 1]].name) << "\","
-                << "\"fare_rupiah\":" << static_cast<int>(round(charged_fare)) << ","
-                << "\"wait_minutes\":" << static_cast<int>(ceil(wait)) << ","
-                << "\"duration_minutes\":" << step_duration << ","
+        size_t e = 0;
+        while (e < route.edges.size()) {
+            const size_t segment_start = e;
+            const Edge* first_edge = route.edges[e];
+            const string segment_route_id = first_edge->route_id;
+            const double segment_elapsed_start = elapsed;
+            double segment_duration = 0.0;
+            double segment_wait = 0.0;
+            double segment_fare = 0.0;
+
+            while (e < route.edges.size()
+                && route.edges[e]->route_id == segment_route_id) {
+                const Edge* edge = route.edges[e];
+                const double wait = edge_wait_minutes(
+                    *edge, last_route_id, departure_hhmm, elapsed);
+                const double edge_duration = edge_travel_minutes(
+                    *edge, graph, route.nodes[e], departure_hhmm,
+                    last_route_id, elapsed);
+                segment_wait += wait;
+                segment_duration += edge_duration;
+                segment_fare += edge_fare(*edge, last_route_id);
+                elapsed += edge_duration;
+                last_route_id = edge->route_id;
+                ++e;
+            }
+
+            const string from_stop = graph.stops[route.nodes[segment_start]].name;
+            const string to_stop = graph.stops[route.nodes[e]].name;
+            if (segment_start > 0) out << ",";
+            out << "{\"route_id\":\"" << json_escape(first_edge->route_id) << "\","
+                << "\"route_code\":\"" << json_escape(first_edge->route_code) << "\","
+                << "\"route_name\":\"" << json_escape(first_edge->route_name) << "\","
+                << "\"color_hex\":\"" << json_escape(first_edge->color_hex) << "\","
+                << "\"mode\":\"" << json_escape(first_edge->mode) << "\","
+                << "\"operator\":\"" << json_escape(first_edge->operator_name) << "\","
+                << "\"fare_model\":\"" << json_escape(first_edge->fare_model) << "\","
+                << "\"from\":\"" << json_escape(from_stop) << "\","
+                << "\"to\":\"" << json_escape(to_stop) << "\","
+                << "\"from_stop\":\"" << json_escape(from_stop) << "\","
+                << "\"to_stop\":\"" << json_escape(to_stop) << "\","
+                << "\"fare_rupiah\":" << static_cast<int>(round(segment_fare)) << ","
+                << "\"wait_minutes\":" << static_cast<int>(ceil(segment_wait)) << ","
+                << "\"duration_minutes\":"
+                << static_cast<int>(ceil(segment_duration)) << ","
                 << "\"departure\":\""
-                << format_time(departure_hhmm, static_cast<int>(ceil(elapsed + wait)))
-                << "\","
+                << format_time(departure_hhmm, static_cast<int>(
+                    ceil(segment_elapsed_start + segment_wait))) << "\","
                 << "\"arrival\":\""
-                << format_time(departure_hhmm, static_cast<int>(ceil(elapsed + duration_minutes)))
+                << format_time(departure_hhmm, static_cast<int>(ceil(elapsed)))
                 << "\"}";
-            last_route_id = edge->route_id;
-            elapsed += duration_minutes;
         }
         out << "]";
         out << "}";

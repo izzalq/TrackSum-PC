@@ -16,7 +16,9 @@ struct Stop {
 struct Edge {
     int to;
     std::string route_id;
+    std::string route_code;
     std::string route_name;
+    std::string color_hex;
     std::string mode;
     std::string operator_name;
     std::string fare_model;
